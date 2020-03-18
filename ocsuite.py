@@ -16,7 +16,7 @@ core = vs.core
 
 
 # noinspection PyProtectedMember
-def ordered_chapters(chapters: Dict[str, Tuple[int, int]],
+def ordered_chapters(chapters: Dict[str, Union[int, List[int]]],
                      /,
                      repeated_chapters: List[str],
                      remuxed_bdmv: str,
@@ -25,27 +25,31 @@ def ordered_chapters(chapters: Dict[str, Tuple[int, int]],
     Creates ordered chapters .xml files, a simple VS script for splitting the BDMV into episode clips, and cuts audio.
 
     :param chapters: a dict of strings and frame ranges in the following format:
-        chapters = {'ep_num|chap_name': (start_frame, end_frame), ...}
+        chapters = {'ep_num|chap_name': [start_frame, end_frame], ...}
         where start_frame and end_frame are INCLUSIVE, different from normal Python slicing syntax.
-        i.e.:
-        chapters = {
-            '01|Part A':      (0, 3770),
-            '01|Title Card':  (3771, 3860),
-            '01|Part B':      (3861, 20883),
-            '01|Middle Card': (20884, 21003),
-            '01|Part C':      (21004, 30041),
-            '01|OP':          (30042, 32200),
-            '01|Part D':      (32201, 33685),
-            '01|Preview':     (33686, 34045),
+        The chapters MUST be listed in chronological order.
 
-            '02|Part A':      (34070, 35747),
-            '02|OP':          (35748, 37906),
-            '02|Part B':      (37907, 51308),
-            '02|Middle Card': (51309, 51428),
-            '02|Part C':      (51429, 65047),
-            '02|ED':          (65048, 67180),
-            '02|Part D':      (67181, 67732),
-            '02|Preview':     (67733, 68092)
+        If chapters are continuous, only start frame needs to be specified. Can be specified as a sole int or a [int].
+
+        i.e.:
+        chapters = {  # inclusive
+            '01|Part A':      0,
+            '01|Title Card':  3771,
+            '01|Part B':      3861,
+            '01|Middle Card': 20884,
+            '01|Part C':      21004,
+            '01|OP':          30042,
+            '01|Part D':      32201,
+            '01|Preview':     [33686, 34045],
+
+            '02|Part A':      [34070],
+            '02|OP':          [35748],
+            '02|Part B':      [37907],
+            '02|Middle Card': [51309],
+            '02|Part C':      [51429],
+            '02|ED':          [65048],
+            '02|Part D':      [67181],
+            '02|Preview':     [67733, 68092]
         }
         See tests.py for a full example.
 
@@ -61,11 +65,24 @@ def ordered_chapters(chapters: Dict[str, Tuple[int, int]],
     :param save_vs_clips_to_file: whether or not to print a simple VapourSynth script for cutting the BDMV into episode
                                   clips or to save it to a file, 'ordered_chapters_script.vpy'
     """
-
     suids = {i: _segment_uid_generator() for i in repeated_chapters}  # assigns a unique SUID to each repeated chapter
 
-    # creates a tree of {'episode': {'chap1': (sframe, eframe), ...}}
-    tree = {}  # Dict[str, Dict[str, Tuple[int, int]]]
+    # if end frame isn't specified, assume it's continuous with next chapter
+    keys = list(chapters.keys())
+    for index, key in enumerate(keys):
+        if type(chapters[key]) == int:
+            if type(chapters[keys[index + 1]]) == int:
+                chapters[key] = [chapters[key], chapters[keys[index + 1]] - 1]
+            else:
+                chapters[key] = [chapters[key], chapters[keys[index + 1]][0] - 1]
+        elif len(chapters[key]) == 1:
+            if type(chapters[keys[index + 1]]) == int:
+                chapters[key].append(chapters[keys[index + 1]] - 1)
+            else:
+                chapters[key].append(chapters[keys[index + 1]][0] - 1)
+
+    # creates a tree of {'episode': {'chap1': [sframe, eframe], ...}}
+    tree = {}  # Dict[str, Dict[str, List[int]]]
     for ep_str, frames in chapters.items():
         ep_num, chap_name = ep_str.split('|')
         tree.setdefault(ep_num, {})[chap_name] = frames
@@ -150,7 +167,7 @@ def ordered_chapters(chapters: Dict[str, Tuple[int, int]],
         for ep_num in clip_list:
             acsuite.eztrim(bdmv_clip, call_list_trims[ep_num], audio_file=remuxed_bdmv, outfile=f'{ep_num}_cut_audio.wav')
 
-    timestamps = {}  # Dict[str, Union[Tuple[str, str], Dict[str, Tuple[str str]]]]
+    timestamps = {}  # Dict[str, Union[Tuple[str, str], Dict[str, Tuple[str, str]]]]
     for chap_name in repeated_chapters:  # {'repeated_chapter': ('s_ts', 'e_ts')}
         begin, end = _compress(clip_list[chap_name][0], clip_list[chap_name][1])
         timestamps[chap_name] = (_f2ts(begin[0], clip=bdmv_clip), _f2ts(end[0] + 1, clip=bdmv_clip))
