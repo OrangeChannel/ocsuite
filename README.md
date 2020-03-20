@@ -26,13 +26,13 @@ chapters = {  # inclusive
     '01|Part D':      32201,
     '01|Preview':     [33686, 34045],
 
-    '02|Part A':      [34070],
-    '02|OP':          [35748],
-    '02|Part B':      [37907],
-    '02|Middle Card': [51309],
-    '02|Part C':      [51429],
-    '02|ED':          [65048],
-    '02|Part D':      [67181],
+    '02|Part A':      34070,
+    '02|OP':          35748,
+    '02|Part B':      37907,
+    '02|Middle Card': 51309,
+    '02|Part C':      51429,
+    '02|ED':          65048,
+    '02|Part D':      67181,
     '02|Preview':     [67733, 68092],
 
 # ... see tests.py for the full example
@@ -77,10 +77,9 @@ ED=bdmv[65048:67181]  # SUID: 11569449511598453506872648520663
 ## Getting Started
 
 ### Dependencies
-- [Python 3.8+](https://www.python.org/downloads/)
 - [acsuite.py]
-  - [VapourSynth](https://github.com/vapoursynth/vapoursynth/releases)
   - [MKVToolNix](https://mkvtoolnix.download/downloads.html)
+  - [VapourSynth R49+](https://github.com/vapoursynth/vapoursynth/releases)
 
 ### Installing
 
@@ -91,21 +90,16 @@ ED=bdmv[65048:67181]  # SUID: 11569449511598453506872648520663
 
 #### Arch Linux
 
-TODO
-<!--
-Install the [AUR package]() `vapoursynth-plugin-ocsuite-git` with your favorite AUR helper:
+Install the [AUR package](https://aur.archlinux.org/packages/vapoursynth-tools-ocsuite-git/) `vapoursynth-tools-ocsuite-git` with your favorite AUR helper:
 
 ```sh
-yay -S vapoursynth-plugin-ocsuite-git
+yay -S vapoursynth-tools-ocsuite-git
 ```
--->
 
 #### Gentoo Linux
 
-TODO
-<!--
 Install via the [VapourSynth portage tree](https://github.com/4re/vapoursynth-portage).
--->
+
 ---
 
 ## Working with Ordered Chapters
