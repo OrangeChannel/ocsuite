@@ -1,231 +1,280 @@
 """Fully automated ordered chapters creation from a remuxed BDMV."""
 __author__ = 'Dave <orangechannel@pm.me>'
-__date__ = '18 March 2020'
+__date__ = '1 August 2020'
 
+import copy
+import fractions
+import functools
+import operator
+import os
+import pathlib
+import random
+import sys
 import xml.etree.ElementTree as ET
-from inspect import stack as n
-from os import urandom
-from random import choice, randint, sample
-from sys import byteorder
-from typing import Dict, List, Tuple, Union
+from typing import Dict, Generator, List, Tuple, Union
 
 import acsuite
 import vapoursynth as vs
 
-core = vs.core
+_Slice = Tuple[int, int]
+_Episode = Dict[str, Union[int, _Slice]]
+_Path = Union[bytes, os.PathLike, pathlib.Path, str]
 
 
-# noinspection PyProtectedMember
-def ordered_chapters(chapters: Dict[str, Union[int, List[int]]],
-                     /,
-                     repeated_chapters: List[str],
-                     remuxed_bdmv: str,
-                     save_vs_clips_to_file: bool = False):
+class Chapter:
     """
-    Creates ordered chapters .xml files, a simple VS script for splitting the BDMV into episode clips, and cuts audio.
+    A dataclass representing a chapter, to be put into a dictionary mapping names to Chapter instances.
 
-    :param chapters: a dict of strings and frame ranges in the following format:
-        chapters = {'ep_num|chap_name': [start_frame, end_frame], ...}
-        where start_frame and end_frame are INCLUSIVE, different from normal Python slicing syntax.
-        The chapters MUST be listed in chronological order.
+    Guaranteed attributes when OC class is initiated are:
+        'name' - string of the chapter's name (matches the dictionary mapping)
+        'start_frame' - starting frame (inclusive)
+        'end_frame' - ending frame (inclusive)
 
-        If chapters are continuous, only start frame needs to be specified. Can be specified as a sole int or a [int].
-
-        i.e.:
-        chapters = {  # inclusive
-            '01|Part A':      0,
-            '01|Title Card':  3771,
-            '01|Part B':      3861,
-            '01|Middle Card': 20884,
-            '01|Part C':      21004,
-            '01|OP':          30042,
-            '01|Part D':      32201,
-            '01|Preview':     [33686, 34045],
-
-            '02|Part A':      [34070],
-            '02|OP':          [35748],
-            '02|Part B':      [37907],
-            '02|Middle Card': [51309],
-            '02|Part C':      [51429],
-            '02|ED':          [65048],
-            '02|Part D':      [67181],
-            '02|Preview':     [67733, 68092]
-        }
-        See tests.py for a full example.
-
-    :param repeated_chapters: a list of chapters that will be encoded separately from the main episodes
-        i.e. `['OP', 'ED']`
-        these chapter names must appear at least once in the dict as a 'chap_name'
-
-    :param remuxed_bdmv: `'/path/to/remuxed_bdmv.mkv'`
-        Works best if *entire show is remuxed into a single, continuous stream* in a .mkv file.
-        For more infomation on the commands needed to combine multiple volumes of a BDMV into a single .mkv file,
-        see README.md.
-
-    :param save_vs_clips_to_file: whether or not to print a simple VapourSynth script for cutting the BDMV into episode
-                                  clips or to save it to a file, 'ordered_chapters_script.vpy'
+    When OC.write_to_xml is called, two more attributes are added:
+        'start_ts' - string of the chapter's start frame converted to a timestamp in HH.mm.ss.nnnnnnnnn form
+        'end_ts' - string of the chapter's (end frame + 1) converted to a timestamp in HH.mm.ss.nnnnnnnnn form
     """
-    suids = {i: _segment_uid_generator() for i in repeated_chapters}  # assigns a unique SUID to each repeated chapter
+    def __init__(self, name: str, start_frame: int):
+        self.name = name
+        self.start_frame = start_frame
 
-    # if end frame isn't specified, assume it's continuous with next chapter
-    keys = list(chapters.keys())
-    for index, key in enumerate(keys):
-        if type(chapters[key]) == int:
-            if type(chapters[keys[index + 1]]) == int:
-                chapters[key] = [chapters[key], chapters[keys[index + 1]] - 1]
-            else:
-                chapters[key] = [chapters[key], chapters[keys[index + 1]][0] - 1]
-        elif len(chapters[key]) == 1:
-            if type(chapters[keys[index + 1]]) == int:
-                chapters[key].append(chapters[keys[index + 1]] - 1)
-            else:
-                chapters[key].append(chapters[keys[index + 1]][0] - 1)
 
-    # creates a tree of {'episode': {'chap1': [sframe, eframe], ...}}
-    tree = {}  # Dict[str, Dict[str, List[int]]]
-    for ep_str, frames in chapters.items():
-        ep_num, chap_name = ep_str.split('|')
-        tree.setdefault(ep_num, {})[chap_name] = frames
+class OC:
+    """
+    Base class for other related ordered chapters functions.
 
-    # creates a dict of {'episode': [sframe1, sframe2, ...]} not including repeated chapters
-    # used for creating the VapourSynth clips and audio cutting
-    begins, ends = {}, {}  # Dict[str, List[int]]
-    for ep_num in tree:
-        begins[ep_num], ends[ep_num]= [], []
-        for chap_name in tree[ep_num]:
-            if chap_name not in repeated_chapters:
-                begins[ep_num].append(tree[ep_num][chap_name][0])
-                ends[ep_num].append(tree[ep_num][chap_name][1])
+    `OC(...).main_tree` is a dictionary contained episodes and their chapter dictionaries of Chapter objects.
+    `OC(...).suids` is a dictionary mapping repeated chapter names to their Mastroka segment UIDs (SUIDs),
+    these are required to be muxed as the SUID for each of the repeated chapter MKVs
+    in order for the chapter files to work properly.
 
-    clip_list = {}  # Dict[str, Tuple[List[int], List[int]]]
-    for ep_num in begins:
-        combined = _combine(begins[ep_num], ends[ep_num])
-        clip_list[ep_num] = combined  # combines lists for audio cutting + splicing
-    for repeated_chap_name in repeated_chapters:
-        for ep_num in tree:
-            if repeated_chap_name in tree[ep_num]:
-                clip_list[repeated_chap_name] = ([tree[ep_num][repeated_chap_name][0]], [tree[ep_num][repeated_chap_name][1]])
-                break  # creates a clip for repeated chapters
+    :param chap_dict:          dictionary of episode names (strings) to a dictionary of chapter names (strings) to ints or tuples of 2 ints
+                                {'Episode 01': {'Part A': 10,   # starts on frame 10, ends on frame 19
+                                                'Part B': 20,   # starts on frame 20, ends on frame 29
+                                                'ED': (30, 39)  # starts on frame 30, ends on frame 39
+                                                },
+                                 'Episode 02': {'OP': 66,            # starts on frame 66, ends on frame 69
+                                                'Part A': (70, 82),  # starts on frame 70, ends on frame 82
+                                                'Part B': (90, 99)   # starts on frame 90, ends on frame 99
+                                                }
+                                 }
+        See README.md for more examples.
 
-    # prints clips and required SUIDs (or saves to file)
-    if save_vs_clips_to_file:
-        save_string = ['import vapoursynth as vs', 'core = vs.core', f'bdmv = core.lsmas.LWLibavSource(r\'{remuxed_bdmv}\')']
-    else:
-        print(f'import vapoursynth as vs\ncore = vs.core\nbdmv = core.lsmas.LWLibavSource(r\'{remuxed_bdmv}\')')
+        All chapters MUST have a start frame, but only the last chapter of each episode must have an ending frame.
+        Frames are INCLUSIVE, so a Python slice of part_a=src[10:20] would start on frame 10, and end on frame 19.
+        If there is no space between neighboring chapters,
+        you DO NOT need to include the end frame for the first chapter,
+        it will be assumed to be continuous with the next chapter (see example above).
 
-    for ep_num in clip_list:
-        if ep_num in repeated_chapters:
-            string = f'{ep_num}='
-        else:
-            string = f'ep{ep_num}='
+        If only giving the start frame, ONLY provide a sole int.
+        Last chapters of each episode MUST be given a tuple of (start frame, end frame) where the frame range is INCLUSIVE.
 
-        if save_vs_clips_to_file:
-            if len(clip_list[ep_num][0]) == 1:  # for chapters with only one frame tuple
-                if ep_num in repeated_chapters:
-                    string += f'bdmv[{clip_list[ep_num][0][0]}:{clip_list[ep_num][1][0] + 1}]  # SUID: {suids[ep_num]}'
+    :param repeated_chapters:  list of strings of names of chapters that are to be cut out of each episode that
+                               contains them and then added back with an external segment reference
+                               (i.e. `['OP', 'ED']` or `['OP']`)
+    """
+    def __init__(self, chap_dict: Dict[str, _Episode], repeated_chapters: List[str]):
+        self.original_dict = chap_dict
+        self.repeated_chapters = repeated_chapters
+
+        main_tree: Dict[str, Dict[str, Chapter]] = {}
+
+        for episode in chap_dict.keys():
+            main_tree[episode] = {}
+            chapter_frames = []
+            for chap_name, chap_tuple in chap_dict[episode].items():
+                if isinstance(chap_tuple, int):
+                    chapter_frames.append([chap_tuple])
+                elif isinstance(chap_tuple, tuple):
+                    chapter_frames.append(list(chap_tuple))
+            for index, name in enumerate(chap_dict[episode].keys()):
+                main_tree[episode][name] = Chapter(name, chapter_frames[index][0])
+                if len(chapter_frames[index]) == 2:
+                    setattr(main_tree[episode][name], 'end_frame', chapter_frames[index][1])
                 else:
-                    string += f'bdmv[{clip_list[ep_num][0][0]}:{clip_list[ep_num][1][0] + 1}]'
+                    try:
+                        setattr(main_tree[episode][name], 'end_frame', chapter_frames[index+1][0] - 1)
+                    except IndexError:
+                        raise ValueError("last chapter of each episode must have an end frame") from None
+
+        main_tree['_repeated_chapters'] = {}
+
+        for ep_dict in main_tree.values():
+            for name, chapter in ep_dict.items():
+                if name in repeated_chapters:
+                    main_tree['_repeated_chapters'][name] = copy.copy(chapter)
+
+        self.main_tree = main_tree
+
+        self.suids = {rchap_name: segment_uid_generator() for rchap_name in main_tree['_repeated_chapters']}
+
+    def clips(self, src_clip: vs.VideoNode) -> Dict[str, vs.VideoNode]:
+        """
+        Returns dictionary of trimmed clips from a source clip.
+        Repeated chapter keys will have a '_' (underscore) prepended to their names to avoid collisions with main episode names.
+
+        :param src_clip:  VideoNode from a remuxed BDMV or something similar including all the frames the the chap_dict
+                          provided to the class constructor.
+        :return:          Dictionary of episode names (or repeated chapters names) to a trimmed clip (VideoNode)
+                          not including the repeated chapters if found.
+        """
+        clip_dict = {}
+        for ep_name, chap_dict in self.main_tree.items():
+            if ep_name == '_repeated_chapters':
+                for repeated_chap_name, rchap in chap_dict.items():
+                    clip_dict['_' + repeated_chap_name] = src_clip[get_slice(rchap)]
             else:
-                for i in range(len(clip_list[ep_num][0])):
-                    string += f'bdmv[{clip_list[ep_num][0][i]}:{clip_list[ep_num][1][i] + 1}]+'
-                string = string[:-1]
-            save_string.append(string)
-        else:
-            if len(clip_list[ep_num][0]) == 1:
-                if ep_num in repeated_chapters:
-                    print(string + f'bdmv[{clip_list[ep_num][0][0]}:{clip_list[ep_num][1][0] + 1}]  # SUID: {suids[ep_num]}')
+                slices = []
+                for chapter in chap_dict.values():
+                    if chapter.name not in self.repeated_chapters:
+                        slices.append(get_slice(chapter))
+                segments = [src_clip[s] for s in slices]
+                clip_dict[ep_name] = functools.reduce(operator.add, segments)
+
+        return clip_dict
+
+    def cut_audio(self, src_clip: vs.VideoNode, audio_file: _Path, base_dir: _Path, *, ffmpeg_path: str = None) -> None:
+        """
+        Cuts audio using acsuite.eztrim() via FFmpeg and a source audio file.
+
+        Outputs audio files in the given directory with `base_dir`.
+
+        Audio files will have the same extension
+        (or be converted to WAV if extension not recognized by FFmpeg) as the input audio file.
+
+        Audio files will be in the form of 'base_dir/{episode name}_cut.ext' where the episode name will be taken from the OC
+        instance's clip dictionary, with repeated chapters being given their own cut audio file in the form of
+        'base_dir/{repeated chap name}_cut.ext'.
+
+        :param src_clip:     Source clip needed to determine frame rate to convert frame numbers into timestamps.
+        :param audio_file:   Base audio file to trim/splice from. Extension and codec will be copied if possible,
+                             otherwise re-encoded to WAV via FFmpeg.
+        :param base_dir:     Base directory (ideally empty) to save cut audio files into. Must be an existing directory.
+        :param ffmpeg_path:  Optional param to specify FFmpeg executable path is `ffmpeg` is not discoverable in your PATH for acsuite.eztrim().
+        """
+        if not os.path.isdir(base_dir):
+            raise NotADirectoryError(f"{base_dir} is not a valid existing directory")
+        cwd = os.getcwd()
+        os.chdir(base_dir)
+
+        for ep_name, ep_dict in self.main_tree.items():
+            if ep_name == '_repeated_chapters':
+                for rchap in ep_dict.values():
+                    s = get_slice(rchap)
+                    acsuite.eztrim(src_clip, (s.start, s.stop), audio_file, rchap.name + '_cut', ffmpeg_path=ffmpeg_path, quiet=True)
+            else:
+                ep_frames = []
+                for chapter in ep_dict.values():
+                    if chapter.name not in self.repeated_chapters:
+                        s = get_slice(chapter)
+                        ep_frames.append([s.start, s.stop])
+                acsuite.eztrim(src_clip, list(compress(ep_frames)), audio_file, ep_name + '_cut', ffmpeg_path=ffmpeg_path, quiet=True)
+
+        os.chdir(cwd)
+
+    def write_to_xml(self, src_clip: vs.VideoNode, base_dir: _Path, *, language: str = 'eng'):
+        """
+        Writes chapter files to XML files recognizable by the Mastroka container.
+
+        The repeated chapters will be inserted into the virtual timeline via external segment references
+        using SUIDs that you will need to mux the repeated chapter files with (can be obtained via OC.suids).
+
+        Chapter files will be saved in the form of 'base_dir/{episode name}_chapters.xml'.
+
+        :param src_clip:  Source clip to determine frame rate to convert frame numbers into timestamps.
+        :param base_dir:  Base directory (ideally empty) to save chapter files into. Must be an existing directory.
+        :param language:  Mastroka language identifier for chapter names.
+            Must be from the 3 letters bibliographic ISO-639-2 list at <https://www.loc.gov/standards/iso639-2/php/English_list.php>.
+            Might support BCP 47 in the future but this should suffice for now. Defaults to 'eng' or English.
+        """
+        if not os.path.isdir(base_dir):
+            raise NotADirectoryError(f"{base_dir} is not a valid existing directory")
+        cwd = os.getcwd()
+        os.chdir(base_dir)
+
+        ts = functools.partial(f2ts, fps=src_clip.fps)
+
+        for repeated_chapter in self.main_tree['_repeated_chapters'].values():
+            slice_ = get_slice(repeated_chapter)
+            corrected_frames = next(squeeze([[slice_.start, slice_.stop]]))
+            setattr(repeated_chapter, 'start_ts', ts(corrected_frames[0]))
+            setattr(repeated_chapter, 'end_ts', ts(corrected_frames[1]))
+
+        for ep_name, chap_dict in self.main_tree.items():
+            frames = []
+            for chapter in chap_dict.values():
+                if chapter.name not in self.repeated_chapters:
+                    slice_ = get_slice(chapter)
+                    frames.append([slice_.start, slice_.stop])
+            corrected_frames = squeeze(frames)
+            for chapter in chap_dict.values():
+                if chapter.name not in self.repeated_chapters:
+                    frames = next(corrected_frames)
+                    setattr(chapter, 'start_ts', ts(frames[0]))
+                    setattr(chapter, 'end_ts', ts(frames[1]))
                 else:
-                    print(string + f'bdmv[{clip_list[ep_num][0][0]}:{clip_list[ep_num][1][0] + 1}]')
-            else:
-                for i in range(len(clip_list[ep_num][0])):
-                    string += f'bdmv[{clip_list[ep_num][0][i]}:{clip_list[ep_num][1][i] + 1}]+'
-                print(string[:-1])
+                    setattr(chapter, 'start_ts', self.main_tree['_repeated_chapters'][chapter.name].start_ts)
+                    setattr(chapter, 'end_ts', self.main_tree['_repeated_chapters'][chapter.name].end_ts)
 
-    if save_vs_clips_to_file:
-        file = open('ordered_chapters_script.vpy', 'x')
-        for i in save_string: file.write(i + '\n')
-        file.close()
-        print('VapourSynth and SUID information written to ordered_chapters_script.vpy')
+        roots = {}
+        for ep_name, chap_dict in self.main_tree.items():
+            if not ep_name.startswith('_'):
+                roots[ep_name] = ET.Element('Chapters')
 
-    # creates a dict of {'episode': [(sframe1, eframe1), (sframe2, eframe2), ...]} for eztrim call
-    call_list_trims = {}  # Dict[str, List[Tuple[int, int]]]
-    for ep_num in clip_list:
-        if len(clip_list[ep_num][0]) == 1:
-            call_list_trims[ep_num] = (clip_list[ep_num][0][0], clip_list[ep_num][1][0] + 1)
+                edition_entry = ET.SubElement(roots[ep_name], 'EditionEntry')
+                ET.SubElement(edition_entry, 'EditionUID').text = str(random.randint(1, int(1E6)))
+                ET.SubElement(edition_entry, 'EditionFlagDefault').text = '1'
+                ET.SubElement(edition_entry, 'EditionFlagOrdered').text = '1'
+
+                for chapter in chap_dict.values():
+                    chap_atom = ET.SubElement(edition_entry, 'ChapterAtom')
+                    ET.SubElement(chap_atom, 'ChapterTimeStart').text = chapter.start_ts
+                    ET.SubElement(chap_atom, 'ChapterTimeEnd').text = chapter.end_ts
+                    ET.SubElement(chap_atom, 'ChapterUID').text = chapter_uid_generator()
+
+                    if chapter.name in self.repeated_chapters:
+                        ET.SubElement(chap_atom, 'ChapterSegmentUID', format="hex").text = self.suids[chapter.name]
+
+                    display = ET.SubElement(chap_atom, 'ChapterDisplay')
+                    ET.SubElement(display, 'ChapterString').text = chapter.name
+                    ET.SubElement(display, 'ChapterLanguage').text = language
+
+        for root_name, root in roots.items():
+            file = open(f'{root_name}_chapters.xml', 'xt')
+            file.write('<?xml version="1.0"?>\n<!-- <!DOCTYPE Chapters SYSTEM "matroskachapters.dtd"> -->\n')
+            file.write(ET.tostring(root, encoding='unicode'))
+            file.close()
+
+        os.chdir(cwd)
+
+
+def get_slice(chapter_: Chapter) -> slice:
+    """Change chapter start and end frame into a slice."""
+    return slice(getattr(chapter_, 'start_frame'), getattr(chapter_, 'end_frame') + 1)
+
+
+def compress(pairs: List[List[int]]) -> Generator[Tuple[int, int], None, None]:
+    """[[1, 2], [3, 4], [4, 5]] -> [(1, 2), (3, 5)]"""
+    it = iter(pairs)
+    q = tuple(next(it))
+    for p in map(tuple, it):
+        if q[1] == p[0]:
+            q = q[0], p[1]
         else:
-            call_list_trims[ep_num] = []
-            for f in range(len(clip_list[ep_num][0])):
-                call_list_trims[ep_num].append((clip_list[ep_num][0][f], clip_list[ep_num][1][f] + 1))
-
-    if '.mkv' in remuxed_bdmv:
-        bdmv_clip = core.lsmas.LWLibavSource(remuxed_bdmv)
-    else:
-        bdmv_clip = core.std.BlankClip(fpsnum=24000, fpsden=1001)
-        print('Using a fake test clip, no audio will be cut.')
-
-    if '.mkv' in remuxed_bdmv:
-        for ep_num in clip_list:
-            acsuite.eztrim(bdmv_clip, call_list_trims[ep_num], audio_file=remuxed_bdmv, outfile=f'{ep_num}_cut_audio.wav')
-
-    timestamps = {}  # Dict[str, Union[Tuple[str, str], Dict[str, Tuple[str, str]]]]
-    for chap_name in repeated_chapters:  # {'repeated_chapter': ('s_ts', 'e_ts')}
-        begin, end = _compress(clip_list[chap_name][0], clip_list[chap_name][1])
-        timestamps[chap_name] = (_f2ts(begin[0], clip=bdmv_clip), _f2ts(end[0] + 1, clip=bdmv_clip))
-    for ep_num in tree:
-        timestamps[ep_num] = {}  # {'episode': {'chapter': ('s_ts', 'e_ts')}}
-        compressed = _compress(begins[ep_num], ends[ep_num])
-        index = 0
-        for chap_name in tree[ep_num]:
-            if chap_name not in repeated_chapters:
-                timestamps[ep_num][chap_name] = (_f2ts(compressed[0][index], clip=bdmv_clip), _f2ts(compressed[1][index] + 1, clip=bdmv_clip))
-                index += 1
-            else:
-                timestamps[ep_num][chap_name] = timestamps[chap_name]
-
-    # XML creation
-    roots = {}
-    for ep_num in tree:
-        roots[ep_num] = ET.Element('Chapters')
-        edition_entry = ET.SubElement(roots[ep_num], 'EditionEntry')
-        ET.SubElement(edition_entry, 'EditionUID').text = str(randint(1, int(1E6)))
-        ET.SubElement(edition_entry, 'EditionFlagDefault').text = '1'
-        ET.SubElement(edition_entry, 'EditionFlagOrdered').text = '1'
-        chapter_atoms = {}
-        for chap_name in timestamps[ep_num]:
-            chapter_atoms[chap_name] = ET.SubElement(edition_entry, 'ChapterAtom')
-            ET.SubElement(chapter_atoms[chap_name], 'ChapterTimeStart').text = timestamps[ep_num][chap_name][0]
-            ET.SubElement(chapter_atoms[chap_name], 'ChapterTimeEnd').text = timestamps[ep_num][chap_name][1]
-            ET.SubElement(chapter_atoms[chap_name], 'ChapterUID').text = str(_chapter_uid_generator())
-
-            if chap_name in repeated_chapters:
-                ET.SubElement(chapter_atoms[chap_name], 'ChapterSegmentUID', format="hex").text = suids[chap_name]
-
-            display = ET.SubElement(chapter_atoms[chap_name], 'ChapterDisplay')
-            ET.SubElement(display, 'ChapterString').text = chap_name
-            ET.SubElement(display, 'ChapterLanguage').text = 'eng'
-
-    for root in roots:
-        file = open(f'{root}_chapters.xml', 'xt')
-        file.write('<?xml version="1.0"?>\n<!-- <!DOCTYPE Chapters SYSTEM "matroskachapters.dtd"> -->\n')
-        file.write(ET.tostring(roots[root], encoding='unicode'))  # probably should have been achieved using ET.ElementTree.write() but this works too
-        file.close()
+            yield q
+            q = p
+    yield q
 
 
-def _segment_uid_generator() -> str:
-    """Generates a 32 int long string for Mastroka SUIDs."""
-    return str(int.from_bytes(urandom(16), byteorder))[:32]
+def squeeze(pairs: List[List[int]], /, _start: int = 0) -> Generator[List[int], None, None]:
+    """[[10, 20], [25, 35], [35, 45], [50, 60]] -> [[0, 10], [10, 20], [20, 30], [30, 40]]"""
+    for a, b in pairs:
+        yield [_start, (_start := _start + b - a)]
 
 
-def _chapter_uid_generator(k: int = 1) -> Union[int, List[int]]:
-    """Random number generator for Mastroka chapters UIDs."""
-    if k == 1:
-        return choice(range(int(1E18), int(1E19)))
-    return sample(range(int(1E18), int(1E19)), k)
-
-
-def _f2ts(f: int, clip: vs.VideoNode) -> str:
+def f2ts(f: int, fps: fractions.Fraction) -> str:
     """Converts frame number to HH:mm:ss.nnnnnnnnn timestamp based on clip's framerate."""
-    t = round(10 ** 9 * f * clip.fps ** -1)
+    t = round(10 ** 9 * f * fps ** -1)
 
     s = t / 10 ** 9
     m = s // 60
@@ -236,68 +285,12 @@ def _f2ts(f: int, clip: vs.VideoNode) -> str:
     return f'{h:02.0f}:{m:02.0f}:{s:012.9f}'
 
 
-def _combine(a: List[int], b: List[int]) -> Tuple[List[int], List[int]]:
-    """Eliminates continuous pairs: (a1,b1)(a2,b2) -> (a1,b2) if b1 == a2"""
-    if len(a) != len(b):
-        raise ValueError(f'{g(n())}: lists must be same length')
-    if len(a) == 1 and len(b) == 1:
-        return a, b
-
-    ca, cb = [], []
-    for i in range(len(a)):
-        if i == 0:
-            ca.append(a[i])
-            if b[i] + 1 != a[i + 1]:
-                cb.append(b[i])
-            continue
-        elif i < len(a) - 1:
-            if a[i] - 1 != b[i - 1]:  # should we skip the start?
-                ca.append(a[i])
-            if b[i] + 1 != a[i + 1]:  # should we skip the end?
-                cb.append(b[i])
-            continue
-        elif i == len(a) - 1:
-            if a[i] - 1 != b[i - 1]:
-                ca.append(a[i])
-            cb.append(b[i])
-
-    return ca, cb
+def segment_uid_generator() -> str:
+    """Generates a 32 int long string for Mastroka SUIDs."""
+    return str(int.from_bytes(os.urandom(16), sys.byteorder))[:32]
 
 
-def _compress(a: List[int], b: List[int]) -> Tuple[List[int], List[int]]:
-    """Compresses lists to become continuous. (5,9)(12,14) -> (0,4)(7,9) -> (0,4)(5,7)"""
-    if len(a) != len(b):
-        raise ValueError(f'{g(n())}: lists must be same length')
+def chapter_uid_generator() -> str:
+    """Random number generator for Mastroka chapter UIDs."""
+    return str(random.choice(range(int(1E18), int(1E19))))
 
-    if a[0] > 0:  # shift all values so that 'a' starts at 0
-        init = a[0]
-        a = [i - init for i in a]
-        b = [i - init for i in b]
-
-    if len(a) == 1 and len(b) == 1:  # (5,9) -> (0,4)
-        return a, b
-
-    index, diff = 1, 0  # initialize this loop
-
-    while index < len(a):
-        for i in range(index, len(a)):
-            if a[i] != b[i - 1] + 1:
-                diff = a[i] - b[i - 1] - 1
-                # we want to shift by one less than the difference so
-                # the pairs become continuous
-
-                index = i
-                break
-
-            diff = 0
-            index += 1
-
-        for i in range(index, len(a)):
-            a[i] -= diff
-            b[i] -= diff
-
-    return a, b
-
-
-# Decorator functions
-g = lambda x: x[0][3]  # g(inspect.stack()) inside a function will print its name
