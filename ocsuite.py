@@ -1,11 +1,9 @@
 """Fully automated ordered chapters creation from a remuxed BDMV."""
 __author__ = 'Dave <orangechannel@pm.me>'
-__date__ = '1 August 2020'
+__date__ = '3 August 2020'
 
 import copy
-import fractions
 import functools
-import operator
 import os
 import pathlib
 import random
@@ -15,6 +13,8 @@ from typing import Dict, Generator, List, Tuple, Union
 
 import acsuite
 import vapoursynth as vs
+
+core = vs.core
 
 _Slice = Tuple[int, int]
 _Episode = Dict[str, Union[int, _Slice]]
@@ -129,11 +129,11 @@ class OC:
                     if chapter.name not in self.repeated_chapters:
                         slices.append(get_slice(chapter))
                 segments = [src_clip[s] for s in slices]
-                clip_dict[ep_name] = functools.reduce(operator.add, segments)
+                clip_dict[ep_name] = core.std.Splice(segments, mismatch=True)
 
         return clip_dict
 
-    def cut_audio(self, src_clip: vs.VideoNode, audio_file: _Path, base_dir: _Path, *, ffmpeg_path: str = None) -> None:
+    def cut_audio(self, src_clip: vs.VideoNode, audio_file: _Path, base_dir: _Path, *, ffmpeg_path: _Path = None, timecodes_file: _Path = None) -> None:
         """
         Cuts audio using acsuite.eztrim() via FFmpeg and a source audio file.
 
@@ -151,6 +151,7 @@ class OC:
                              otherwise re-encoded to WAV via FFmpeg.
         :param base_dir:     Base directory (ideally empty) to save cut audio files into. Must be an existing directory.
         :param ffmpeg_path:  Optional param to specify FFmpeg executable path is `ffmpeg` is not discoverable in your PATH for acsuite.eztrim().
+        :param timecodes_file: Optional timecodes v2 file for acsuite.eztrim() to use to speed up VFR clips. Not needed as eztrim will fallback to a slower frames() method instead.
         """
         if not os.path.isdir(base_dir):
             raise NotADirectoryError(f"{base_dir} is not a valid existing directory")
@@ -161,14 +162,14 @@ class OC:
             if ep_name == '_repeated_chapters':
                 for rchap in ep_dict.values():
                     s = get_slice(rchap)
-                    acsuite.eztrim(src_clip, (s.start, s.stop), audio_file, rchap.name + '_cut', ffmpeg_path=ffmpeg_path, quiet=True)
+                    acsuite.eztrim(src_clip, (s.start, s.stop), audio_file, rchap.name + '_cut', ffmpeg_path=ffmpeg_path, quiet=True, timecodes_file=timecodes_file)
             else:
                 ep_frames = []
                 for chapter in ep_dict.values():
                     if chapter.name not in self.repeated_chapters:
                         s = get_slice(chapter)
                         ep_frames.append([s.start, s.stop])
-                acsuite.eztrim(src_clip, list(compress(ep_frames)), audio_file, ep_name + '_cut', ffmpeg_path=ffmpeg_path, quiet=True)
+                acsuite.eztrim(src_clip, list(compress(ep_frames)), audio_file, ep_name + '_cut', ffmpeg_path=ffmpeg_path, quiet=True, timecodes_file=timecodes_file)
 
         os.chdir(cwd)
 
@@ -192,15 +193,19 @@ class OC:
         cwd = os.getcwd()
         os.chdir(base_dir)
 
-        ts = functools.partial(f2ts, fps=src_clip.fps)
+        clips = self.clips(src_clip)
 
         for repeated_chapter in self.main_tree['_repeated_chapters'].values():
             slice_ = get_slice(repeated_chapter)
             corrected_frames = next(squeeze([[slice_.start, slice_.stop]]))
+            clip = clips['_' + repeated_chapter.name]
+            ts = functools.partial(acsuite.f2ts, precision=9, src_clip=clip)
             setattr(repeated_chapter, 'start_ts', ts(corrected_frames[0]))
             setattr(repeated_chapter, 'end_ts', ts(corrected_frames[1]))
 
         for ep_name, chap_dict in self.main_tree.items():
+            clip = clips[ep_name]
+            ts = functools.partial(acsuite.f2ts, precision=9, src_clip=clip)
             frames = []
             for chapter in chap_dict.values():
                 if chapter.name not in self.repeated_chapters:
@@ -270,19 +275,6 @@ def squeeze(pairs: List[List[int]], /, _start: int = 0) -> Generator[List[int], 
     """[[10, 20], [25, 35], [35, 45], [50, 60]] -> [[0, 10], [10, 20], [20, 30], [30, 40]]"""
     for a, b in pairs:
         yield [_start, (_start := _start + b - a)]
-
-
-def f2ts(f: int, fps: fractions.Fraction) -> str:
-    """Converts frame number to HH:mm:ss.nnnnnnnnn timestamp based on clip's framerate."""
-    t = round(10 ** 9 * f * fps ** -1)
-
-    s = t / 10 ** 9
-    m = s // 60
-    s %= 60
-    h = m // 60
-    m %= 60
-
-    return f'{h:02.0f}:{m:02.0f}:{s:012.9f}'
 
 
 def segment_uid_generator() -> str:
